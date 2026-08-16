@@ -1,0 +1,13 @@
+{
+  "name": "khoi-mc-tos-backend",
+  "version": "1.0.0",
+  "description": "Verification backend for Khoi's Minecraft Server ToS gate (plugin + policy.html)",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
