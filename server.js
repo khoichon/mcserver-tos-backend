@@ -8,18 +8,29 @@
  *   2. policy.html, the public verification webpage (authenticated only by
  *      possession of the 8-character code — no login system needed)
  *
- * Storage is a single JSON file for simplicity. Swap `loadDB`/`saveDB` for a
- * real database if you outgrow it.
+ * Storage: Supabase (Postgres). Run supabase_schema.sql once against your
+ * project before starting the server. Requires SUPABASE_URL and
+ * SUPABASE_SERVICE_ROLE_KEY (the service role key, NOT the anon key — this
+ * server does its own access control and needs to bypass RLS).
  */
 
 const express = require('express');
-const fs = require('fs');
-const path = require('path');
 const crypto = require('crypto');
+const { createClient } = require('@supabase/supabase-js');
 
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY || 'change-me-please';
-const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'data.json');
+
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+  console.error('Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY environment variables.');
+  process.exit(1);
+}
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+  auth: { persistSession: false },
+});
 
 const CODE_TTL_MS = 30 * 60 * 1000; // pending verification codes expire after 30 minutes
 const QUIZ_SIZE = 5; // number of questions asked per verification attempt
@@ -48,34 +59,86 @@ const QUIZ_BANK = [
 ];
 
 // ---------------------------------------------------------------------------
-// Tiny JSON-file datastore
+// Supabase-backed datastore helpers
+//
+// Tables (see supabase_schema.sql):
+//   players(uuid text pk, username text, verified bool, verified_at timestamptz, verified_by text)
+//   pending(code text pk, uuid text, username text, quiz jsonb, created_at timestamptz, expires_at timestamptz)
 // ---------------------------------------------------------------------------
-function loadDB() {
-  if (!fs.existsSync(DB_PATH)) {
-    return { players: {}, pending: {} };
-  }
-  try {
-    return JSON.parse(fs.readFileSync(DB_PATH, 'utf8'));
-  } catch (err) {
-    console.error('Failed to read DB, starting fresh:', err);
-    return { players: {}, pending: {} };
-  }
+
+async function getPlayer(uuid) {
+  const { data, error } = await supabase.from('players').select('*').eq('uuid', uuid).maybeSingle();
+  if (error) throw error;
+  return data;
 }
 
-let db = loadDB();
-let saveTimer = null;
-function saveDB() {
-  clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
-    fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2));
-  }, 50);
+async function upsertPlayer(uuid, fields) {
+  const { error } = await supabase.from('players').upsert({ uuid, ...fields });
+  if (error) throw error;
 }
 
-function generateCode() {
+async function getPending(code) {
+  const { data, error } = await supabase.from('pending').select('*').eq('code', code).maybeSingle();
+  if (error) throw error;
+  return data;
+}
+
+async function findPendingByUuid(uuid) {
+  const { data, error } = await supabase
+    .from('pending')
+    .select('*')
+    .eq('uuid', uuid)
+    .gt('expires_at', new Date().toISOString())
+    .limit(1)
+    .maybeSingle();
+  if (error) throw error;
+  return data;
+}
+
+async function insertPending(code, { uuid, username, quiz }) {
+  const now = Date.now();
+  const { error } = await supabase.from('pending').insert({
+    code,
+    uuid,
+    username,
+    quiz,
+    created_at: new Date(now).toISOString(),
+    expires_at: new Date(now + CODE_TTL_MS).toISOString(),
+  });
+  if (error) throw error;
+}
+
+async function updatePendingQuiz(code, quiz) {
+  const { error } = await supabase.from('pending').update({ quiz }).eq('code', code);
+  if (error) throw error;
+}
+
+async function deletePending(code) {
+  const { error } = await supabase.from('pending').delete().eq('code', code);
+  if (error) throw error;
+}
+
+async function deletePendingByUuid(uuid) {
+  const { error } = await supabase.from('pending').delete().eq('uuid', uuid);
+  if (error) throw error;
+}
+
+async function purgeExpired() {
+  const { error } = await supabase.from('pending').delete().lt('expires_at', new Date().toISOString());
+  if (error) throw error;
+}
+
+function isExpired(entry) {
+  return !entry || Date.now() > new Date(entry.expires_at).getTime();
+}
+
+async function generateUniqueCode() {
   let code;
+  let existing;
   do {
     code = Array.from({ length: 8 }, () => CODE_ALPHABET[crypto.randomInt(CODE_ALPHABET.length)]).join('');
-  } while (db.pending[code]);
+    existing = await getPending(code);
+  } while (existing);
   return code;
 }
 
@@ -91,23 +154,6 @@ function pickQuiz() {
 
 function stripAnswers(quiz) {
   return quiz.map(({ id, question, options }) => ({ id, question, options }));
-}
-
-function isExpired(entry) {
-  return !entry || Date.now() > entry.expiresAt;
-}
-
-function purgeExpired() {
-  for (const [code, entry] of Object.entries(db.pending)) {
-    if (isExpired(entry)) delete db.pending[code];
-  }
-}
-
-function findPendingByUuid(uuid) {
-  for (const [code, entry] of Object.entries(db.pending)) {
-    if (entry.uuid === uuid && !isExpired(entry)) return { code, entry };
-  }
-  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -133,106 +179,104 @@ function requireApiKey(req, res, next) {
   next();
 }
 
+// Wrap async route handlers so thrown/rejected errors reach Express's error handler
+// instead of crashing the process.
+function asyncRoute(handler) {
+  return (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
+}
+
 // ---------------------------------------------------------------------------
 // Plugin routes (server-to-server, X-API-Key required)
 // ---------------------------------------------------------------------------
 
 // Called on player login: returns whether they're verified, or issues/reuses a code.
-app.post('/api/plugin/session', requireApiKey, (req, res) => {
+app.post('/api/plugin/session', requireApiKey, asyncRoute(async (req, res) => {
   const { uuid, username } = req.body || {};
   if (!uuid || !username) return res.status(400).json({ message: 'uuid and username are required.' });
 
-  purgeExpired();
-  const player = db.players[uuid];
+  await purgeExpired();
+  const player = await getPlayer(uuid);
   if (player && player.verified) {
     return res.json({ verified: true });
   }
 
-  db.players[uuid] = db.players[uuid] || { username, verified: false };
-  db.players[uuid].username = username;
+  await upsertPlayer(uuid, {
+    username,
+    verified: player ? player.verified : false,
+  });
 
-  const existing = findPendingByUuid(uuid);
+  const existing = await findPendingByUuid(uuid);
   if (existing) {
-    saveDB();
     return res.json({ verified: false, code: existing.code });
   }
 
-  const code = generateCode();
-  db.pending[code] = {
-    uuid,
-    username,
-    quiz: pickQuiz(),
-    createdAt: Date.now(),
-    expiresAt: Date.now() + CODE_TTL_MS,
-  };
-  saveDB();
+  const code = await generateUniqueCode();
+  const quiz = pickQuiz();
+  await insertPending(code, { uuid, username, quiz });
   res.json({ verified: false, code });
-});
+}));
 
 // Quick status check (used by /tos test, and can be polled if desired).
-app.get('/api/plugin/status/:uuid', requireApiKey, (req, res) => {
-  const player = db.players[req.params.uuid];
+app.get('/api/plugin/status/:uuid', requireApiKey, asyncRoute(async (req, res) => {
+  const player = await getPlayer(req.params.uuid);
   res.json({ verified: !!(player && player.verified) });
-});
+}));
 
 // Force a player back into an unverified state and issue a fresh code.
 // Used by the in-game "trigger verification with kick" command.
-app.post('/api/plugin/reset', requireApiKey, (req, res) => {
+app.post('/api/plugin/reset', requireApiKey, asyncRoute(async (req, res) => {
   const { uuid, username } = req.body || {};
   if (!uuid || !username) return res.status(400).json({ message: 'uuid and username are required.' });
 
-  purgeExpired();
-  db.players[uuid] = { username, verified: false };
+  await purgeExpired();
+  await upsertPlayer(uuid, { username, verified: false, verified_at: null, verified_by: null });
+  await deletePendingByUuid(uuid);
 
-  const existing = findPendingByUuid(uuid);
-  if (existing) delete db.pending[existing.code];
-
-  const code = generateCode();
-  db.pending[code] = {
-    uuid,
-    username,
-    quiz: pickQuiz(),
-    createdAt: Date.now(),
-    expiresAt: Date.now() + CODE_TTL_MS,
-  };
-  saveDB();
+  const code = await generateUniqueCode();
+  const quiz = pickQuiz();
+  await insertPending(code, { uuid, username, quiz });
   res.json({ code });
-});
+}));
 
 // Staff manually verifies a player by the code the player read out to them.
 // Used by /tos verifycode <code> (requires the tos-control permission in-game).
-app.post('/api/plugin/manual-verify', requireApiKey, (req, res) => {
+app.post('/api/plugin/manual-verify', requireApiKey, asyncRoute(async (req, res) => {
   const { code } = req.body || {};
   if (!code) return res.status(400).json({ message: 'code is required.' });
 
-  const entry = db.pending[code.toUpperCase()];
+  const upperCode = code.toUpperCase();
+  const entry = await getPending(upperCode);
   if (isExpired(entry)) {
     return res.status(404).json({ message: 'No pending verification found for that code.' });
   }
 
-  db.players[entry.uuid] = { username: entry.username, verified: true, verifiedAt: Date.now(), verifiedBy: 'staff' };
-  delete db.pending[code.toUpperCase()];
-  saveDB();
+  await upsertPlayer(entry.uuid, {
+    username: entry.username,
+    verified: true,
+    verified_at: new Date().toISOString(),
+    verified_by: 'staff',
+  });
+  await deletePending(upperCode);
   res.json({ success: true, username: entry.username });
-});
+}));
 
 // ---------------------------------------------------------------------------
 // Public site routes (used by policy.html — no API key, code is the secret)
 // ---------------------------------------------------------------------------
 
-app.get('/api/site/lookup/:code', (req, res) => {
+app.get('/api/site/lookup/:code', asyncRoute(async (req, res) => {
   const code = String(req.params.code || '').toUpperCase();
-  const entry = db.pending[code];
+  const entry = await getPending(code);
   if (isExpired(entry)) {
     return res.status(404).json({ message: 'That code is invalid or has expired. Please rejoin the server to get a new one.' });
   }
   res.json({ username: entry.username, quiz: stripAnswers(entry.quiz) });
-});
+}));
 
-app.post('/api/site/submit', (req, res) => {
+app.post('/api/site/submit', asyncRoute(async (req, res) => {
   const { code, sections, answers } = req.body || {};
   const upperCode = String(code || '').toUpperCase();
-  const entry = db.pending[upperCode];
+  const entry = await getPending(upperCode);
   if (isExpired(entry)) {
     return res.status(404).json({ message: 'That code is invalid or has expired. Please rejoin the server to get a new one.' });
   }
@@ -250,22 +294,33 @@ app.post('/api/site/submit', (req, res) => {
   const allCorrect = entry.quiz.every((q) => answers && answers[q.id] === q.answer);
   if (!allCorrect) {
     // Give a fresh set of questions on retry so answers can't just be memorized by position.
-    entry.quiz = pickQuiz();
-    saveDB();
+    const freshQuiz = pickQuiz();
+    await updatePendingQuiz(upperCode, freshQuiz);
     return res.status(400).json({
       success: false,
       message: 'One or more answers were incorrect. Please review the Terms and try again.',
-      quiz: stripAnswers(entry.quiz),
+      quiz: stripAnswers(freshQuiz),
     });
   }
 
-  db.players[entry.uuid] = { username: entry.username, verified: true, verifiedAt: Date.now(), verifiedBy: 'self' };
-  delete db.pending[upperCode];
-  saveDB();
+  await upsertPlayer(entry.uuid, {
+    username: entry.username,
+    verified: true,
+    verified_at: new Date().toISOString(),
+    verified_by: 'self',
+  });
+  await deletePending(upperCode);
   res.json({ success: true });
-});
+}));
 
 app.get('/api/health', (req, res) => res.json({ ok: true }));
+
+// Fallback error handler for anything thrown/rejected in asyncRoute handlers
+// (e.g. Supabase connectivity issues).
+app.use((err, req, res, next) => { // eslint-disable-line no-unused-vars
+  console.error('Unhandled error:', err);
+  res.status(500).json({ message: 'Internal server error.' });
+});
 
 app.listen(PORT, () => {
   console.log(`ToS verification backend listening on port ${PORT}`);
